@@ -12,10 +12,10 @@ index 6a40f85..d0c145d 100644
  bsd/dev/sweet_sample.c			standard
 diff --git a/bsd/dev/herolte_drop.c b/bsd/dev/herolte_drop.c
 new file mode 100644
-index 0000000..e3fa75e
+index 0000000..ee81faf
 --- /dev/null
 +++ b/bsd/dev/herolte_drop.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,226 @@
 +/*
 + * HEROLTE drop zone: files for the iOS root written from TWRP, without
 + * rebuilding the root image (the S7 has no network to copy them over).
@@ -100,6 +100,19 @@ index 0000000..e3fa75e
 +		}
 +	}
 +	return r->buf + (off - r->pos);
++}
++
++/* A ".." path component (the kernel has no strstr). */
++static bool
++hdrop_has_dotdot(const char *path)
++{
++	for (const char *p = path; *p; p++) {
++		if (p[0] == '.' && p[1] == '.' && (p == path || p[-1] == '/') &&
++		    (p[2] == '/' || p[2] == '\0')) {
++			return true;
++		}
++	}
++	return false;
 +}
 +
 +static int
@@ -209,7 +222,7 @@ index 0000000..e3fa75e
 +		uint64_t data = off + ((sizeof(e) + e.path_len + 7) & ~7ull);
 +		off = data + ((e.size + 7) & ~7ull);
 +		int error;
-+		if (strncmp(path, HDROP_PREFIX, strlen(HDROP_PREFIX)) != 0 || strstr(path, "/../") != NULL) {
++		if (strncmp(path, HDROP_PREFIX, strlen(HDROP_PREFIX)) != 0 || hdrop_has_dotdot(path)) {
 +			error = EPERM;
 +		} else if (e.mode == 0) {
 +			error = hdrop_mkdir(path, 0755, ctx);
