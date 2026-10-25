@@ -1,0 +1,477 @@
+/*
+ * libdrm stand-in for Mesa's Panfrost on the Galaxy S7's iOS: the panfrost
+ * DRM ioctls Mesa issues, answered with the kernel's HeroGPU IOKit user
+ * client (iokit/Kernel/arm/HeroGPU.cpp). Built as libdrm.2.dylib; Mesa
+ * links it in place of the real libdrm (headers from libdrm 2.4.124).
+ *
+ * One GPU, one connection per process. The "fd" Mesa holds is a real file
+ * descriptor on /dev/null (Mesa dups and closes it); every call is ours.
+ * BO mmap goes through herodrm_mmap() (Mesa's pan_kmod_bo_mmap is patched
+ * to call it on Apple): MMAP_BO hands out handle << 32 as the offset.
+ * Submit is synchronous in the kernel, so syncobjs are always signaled.
+ *
+ * Environment: HERODRM_HEAP_MB caps the tiler heap BO (default 32; the
+ * kernel buffers are wired, Mesa asks for 128 MiB), HERODRM_DEBUG=1 logs
+ * every call to the kernel log.
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <xf86drm.h>
+#include "drm-uapi/panfrost_drm.h"
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
+
+/* IOKit, declared here: the iOS SDK ships IOKit without its headers. */
+typedef mach_port_t io_object_t;
+typedef io_object_t io_service_t;
+typedef mach_port_t io_connect_t;
+extern const mach_port_t kIOMainPortDefault;
+CFMutableDictionaryRef IOServiceMatching(const char *name);
+io_service_t IOServiceGetMatchingService(mach_port_t main, CFDictionaryRef matching);
+kern_return_t IOServiceOpen(io_service_t service, task_port_t task, uint32_t type,
+                            io_connect_t *connect);
+kern_return_t IOObjectRelease(io_object_t object);
+kern_return_t IOConnectCallMethod(io_connect_t connection, uint32_t selector,
+                                  const uint64_t *input, uint32_t inputCnt,
+                                  const void *inputStruct, size_t inputStructCnt,
+                                  uint64_t *output, uint32_t *outputCnt,
+                                  void *outputStruct, size_t *outputStructCnt);
+
+#define EXPORT __attribute__((visibility("default")))
+
+enum { SEL_PARAM, SEL_CREATE, SEL_FREE, SEL_MAP, SEL_SUBMIT, SEL_LOG };
+
+#define MAX_BOS 4096
+
+struct hbo {
+   uint64_t va, size;
+   uint64_t cpu;
+};
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static io_connect_t conn;
+static struct hbo bos[MAX_BOS + 1];     /* by kernel handle */
+static int debug = -1;
+static uint64_t submits, faults;
+
+static uint32_t
+call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nout)
+{
+   uint32_t n = nout;
+   kern_return_t kr = IOConnectCallMethod(conn, sel, in, nin, NULL, 0, out, &n, NULL, NULL);
+   return kr;
+}
+
+static int connect_gpu(void);
+
+EXPORT void
+herodrm_log(const char *fmt, ...)
+{
+   char line[1024];
+   va_list ap;
+   va_start(ap, fmt);
+   int n = vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   if (n < 0)
+      return;
+   if (n >= (int)sizeof(line))
+      n = sizeof(line) - 1;
+   if (!conn)
+      connect_gpu();    /* a test's first lines; not under the lock */
+   if (conn)
+      IOConnectCallMethod(conn, SEL_LOG, NULL, 0, line, n, NULL, NULL, NULL, NULL);
+   fprintf(stderr, "herodrm: %s\n", line);
+}
+
+#define DBG(...) do { if (debug > 0) herodrm_log(__VA_ARGS__); } while (0)
+
+static int
+fail(int e)
+{
+   errno = e;
+   return -1;
+}
+
+/* Open the HeroGPU user client once; 0 on success. */
+static int
+connect_gpu(void)
+{
+   if (conn)
+      return 0;
+   if (debug < 0) {
+      const char *d = getenv("HERODRM_DEBUG");
+      debug = d && *d == '1';
+   }
+   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+                                                  IOServiceMatching("HeroGPU"));
+   if (!svc)
+      return -1;
+   kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+   IOObjectRelease(svc);
+   if (kr != KERN_SUCCESS) {
+      conn = 0;
+      return -1;
+   }
+   DBG("connected");
+   return 0;
+}
+
+EXPORT int
+drmOpenWithType(const char *name, const char *busid, int type)
+{
+   (void)busid;
+   (void)type;
+   if (name && strcmp(name, "panfrost") != 0)
+      return fail(ENODEV);
+   pthread_mutex_lock(&lock);
+   int r = connect_gpu();
+   pthread_mutex_unlock(&lock);
+   if (r)
+      return fail(ENODEV);
+   return open("/dev/null", O_RDWR | O_CLOEXEC);
+}
+
+EXPORT int
+drmOpen(const char *name, const char *busid)
+{
+   return drmOpenWithType(name, busid, 0);
+}
+
+EXPORT int
+drmClose(int fd)
+{
+   return close(fd);
+}
+
+EXPORT drmVersionPtr
+drmGetVersion(int fd)
+{
+   (void)fd;
+   drmVersionPtr v = calloc(1, sizeof(*v));
+   if (!v)
+      return NULL;
+   /* 1.2: HEAP/NOEXEC BOs and MADVISE; no timestamp query (1.3). */
+   v->version_major = 1;
+   v->version_minor = 2;
+   v->name = strdup("panfrost");
+   v->name_len = 8;
+   v->date = strdup("20251025");
+   v->date_len = 8;
+   v->desc = strdup("HeroGPU Mali-T880 (Galaxy S7)");
+   v->desc_len = (int)strlen(v->desc);
+   return v;
+}
+
+EXPORT void
+drmFreeVersion(drmVersionPtr v)
+{
+   if (!v)
+      return;
+   free(v->name);
+   free(v->date);
+   free(v->desc);
+   free(v);
+}
+
+EXPORT int
+drmGetCap(int fd, uint64_t capability, uint64_t *value)
+{
+   (void)fd;
+   (void)capability;
+   *value = 0;
+   return 0;
+}
+
+static unsigned
+heap_cap(void)
+{
+   const char *s = getenv("HERODRM_HEAP_MB");
+   unsigned mb = s ? (unsigned)atoi(s) : 32;
+   return (mb ? mb : 32) << 20;
+}
+
+static int
+create_bo(struct drm_panfrost_create_bo *req)
+{
+   uint64_t size = req->size;
+   if (req->flags & PANFROST_BO_HEAP && size > heap_cap())
+      size = heap_cap();
+   uint64_t in = size, out[3] = {0};
+   uint32_t kr = call(SEL_CREATE, &in, 1, out, 3);
+   if (kr || out[0] == 0 || out[0] > MAX_BOS) {
+      herodrm_log("CREATE_BO %llu bytes (flags 0x%x) failed: 0x%x",
+                  (unsigned long long)size, req->flags, kr);
+      return fail(ENOMEM);
+   }
+   req->handle = (uint32_t)out[0];
+   req->offset = out[1];
+   bos[out[0]] = (struct hbo){ .va = out[1], .size = out[2] };
+   DBG("CREATE_BO %u: %llu bytes at 0x%llx flags 0x%x", req->handle,
+       (unsigned long long)out[2], (unsigned long long)out[1], req->flags);
+   return 0;
+}
+
+static struct hbo *
+lookup(uint32_t handle)
+{
+   return handle && handle <= MAX_BOS && bos[handle].va ? &bos[handle] : NULL;
+}
+
+static int
+free_bo(uint32_t handle)
+{
+   if (!lookup(handle))
+      return fail(EINVAL);
+   uint64_t in = handle;
+   call(SEL_FREE, &in, 1, NULL, 0);
+   memset(&bos[handle], 0, sizeof(bos[handle]));
+   DBG("FREE_BO %u", handle);
+   return 0;
+}
+
+static int
+submit(struct drm_panfrost_submit *s)
+{
+   uint64_t in[2] = { s->jc, (s->requirements & PANFROST_JD_REQ_FS) ? 0 : 1 }, out[2] = {0};
+   uint32_t kr = call(SEL_SUBMIT, in, 2, out, 2);
+   submits++;
+   if (kr || out[0]) {
+      faults++;
+      if (faults <= 16 || debug > 0)
+         herodrm_log("SUBMIT #%llu jc 0x%llx js %llu: kr 0x%x status 0x%llx (%llu us)",
+                     (unsigned long long)submits, (unsigned long long)s->jc,
+                     (unsigned long long)in[1], kr, (unsigned long long)out[0],
+                     (unsigned long long)out[1]);
+   } else {
+      DBG("SUBMIT #%llu jc 0x%llx js %llu: %llu us", (unsigned long long)submits,
+          (unsigned long long)s->jc, (unsigned long long)in[1], (unsigned long long)out[1]);
+   }
+   /* A faulting job is reported, not fatal: Mesa would abort on an error. */
+   return kr ? fail(EIO) : 0;
+}
+
+EXPORT int
+drmIoctl(int fd, unsigned long request, void *arg)
+{
+   (void)fd;
+   int r = 0;
+   pthread_mutex_lock(&lock);
+   if (connect_gpu()) {
+      pthread_mutex_unlock(&lock);
+      return fail(ENODEV);
+   }
+   switch (request) {
+   case DRM_IOCTL_PANFROST_GET_PARAM: {
+      struct drm_panfrost_get_param *p = arg;
+      uint64_t in = p->param, out = 0;
+      if (call(SEL_PARAM, &in, 1, &out, 1))
+         r = fail(EINVAL);
+      else
+         p->value = out;
+      break;
+   }
+   case DRM_IOCTL_PANFROST_CREATE_BO:
+      r = create_bo(arg);
+      break;
+   case DRM_IOCTL_GEM_CLOSE:
+      r = free_bo(((struct drm_gem_close *)arg)->handle);
+      break;
+   case DRM_IOCTL_PANFROST_GET_BO_OFFSET: {
+      struct drm_panfrost_get_bo_offset *p = arg;
+      struct hbo *bo = lookup(p->handle);
+      if (bo)
+         p->offset = bo->va;
+      else
+         r = fail(EINVAL);
+      break;
+   }
+   case DRM_IOCTL_PANFROST_MMAP_BO: {
+      struct drm_panfrost_mmap_bo *p = arg;
+      if (lookup(p->handle))
+         p->offset = (uint64_t)p->handle << 32;
+      else
+         r = fail(EINVAL);
+      break;
+   }
+   case DRM_IOCTL_PANFROST_WAIT_BO:
+      break;            /* every submit has finished on return */
+   case DRM_IOCTL_PANFROST_MADVISE:
+      ((struct drm_panfrost_madvise *)arg)->retained = 1;
+      break;
+   case DRM_IOCTL_PANFROST_SUBMIT:
+      r = submit(arg);
+      break;
+   default:
+      herodrm_log("unhandled ioctl 0x%lx", request);
+      r = fail(EINVAL);
+      break;
+   }
+   pthread_mutex_unlock(&lock);
+   return r;
+}
+
+/* mmap() of a BO: offset is handle << 32 plus the offset inside the BO. */
+EXPORT void *
+herodrm_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset)
+{
+   (void)addr;
+   (void)prot;
+   (void)flags;
+   (void)fd;
+   uint32_t handle = (uint32_t)((uint64_t)offset >> 32);
+   uint64_t inner = (uint64_t)offset & 0xffffffffull;
+   void *p = MAP_FAILED;
+   pthread_mutex_lock(&lock);
+   struct hbo *bo = lookup(handle);
+   if (bo && inner + size <= bo->size) {
+      if (!bo->cpu) {
+         uint64_t in = handle, out = 0;
+         if (call(SEL_MAP, &in, 1, &out, 1) == 0)
+            bo->cpu = out;
+      }
+      if (bo->cpu)
+         p = (void *)(uintptr_t)(bo->cpu + inner);
+   }
+   pthread_mutex_unlock(&lock);
+   if (p == MAP_FAILED) {
+      herodrm_log("mmap of BO %u (+0x%llx, %zu bytes) failed", handle,
+                  (unsigned long long)inner, size);
+      errno = EINVAL;
+   }
+   return p;
+}
+
+/* The kernel keeps one mapping per BO until it is freed. */
+EXPORT int
+herodrm_munmap(void *addr, size_t size)
+{
+   (void)addr;
+   (void)size;
+   return 0;
+}
+
+EXPORT int
+drmCloseBufferHandle(int fd, uint32_t handle)
+{
+   (void)fd;
+   pthread_mutex_lock(&lock);
+   int r = free_bo(handle);
+   pthread_mutex_unlock(&lock);
+   return r;
+}
+
+/* No dma-buf: nothing is shared with another process. */
+EXPORT int
+drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
+{
+   (void)fd; (void)handle; (void)flags; (void)prime_fd;
+   return fail(ENOSYS);
+}
+
+EXPORT int
+drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
+{
+   (void)fd; (void)prime_fd; (void)handle;
+   return fail(ENOSYS);
+}
+
+/* Syncobjs: submits are synchronous, so every syncobj is signaled. */
+static uint32_t next_syncobj = 1;
+
+EXPORT int
+drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+   (void)fd; (void)flags;
+   pthread_mutex_lock(&lock);
+   *handle = next_syncobj++;
+   pthread_mutex_unlock(&lock);
+   return 0;
+}
+
+EXPORT int
+drmSyncobjDestroy(int fd, uint32_t handle)
+{
+   (void)fd; (void)handle;
+   return 0;
+}
+
+EXPORT int
+drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
+               unsigned flags, uint32_t *first_signaled)
+{
+   (void)fd; (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
+   if (first_signaled)
+      *first_signaled = 0;
+   return 0;
+}
+
+EXPORT int
+drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num_handles,
+                       int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
+{
+   (void)points;
+   return drmSyncobjWait(fd, handles, num_handles, timeout_nsec, flags, first_signaled);
+}
+
+EXPORT int
+drmSyncobjReset(int fd, const uint32_t *handles, uint32_t handle_count)
+{
+   (void)fd; (void)handles; (void)handle_count;
+   return 0;
+}
+
+EXPORT int
+drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count)
+{
+   (void)fd; (void)handles; (void)handle_count;
+   return 0;
+}
+
+EXPORT int
+drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
+                   uint64_t src_point, uint32_t flags)
+{
+   (void)fd; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
+   return 0;
+}
+
+/* A sync file is a /dev/null descriptor: already signaled. (Mesa treats
+ * -1 as a failed export and makes no fence.) */
+EXPORT int
+drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+   (void)fd; (void)handle;
+   *sync_file_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+   return *sync_file_fd < 0 ? -1 : 0;
+}
+
+EXPORT int
+drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
+{
+   (void)fd; (void)handle; (void)sync_file_fd;
+   return 0;
+}
+
+EXPORT int
+drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
+{
+   (void)obj_fd;
+   return drmSyncobjCreate(fd, 0, handle);
+}
+
+EXPORT int
+drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
+{
+   (void)fd; (void)handle;
+   *obj_fd = -1;
+   return fail(ENOSYS);
+}
