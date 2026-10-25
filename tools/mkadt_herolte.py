@@ -37,7 +37,7 @@ def child(node, name):
     raise ValueError(f'missing donor ADT node {name}')
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3, device='herolte'):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     if scale == 2:
         # --scale2 (as syncmodz/ios-s9): a whole iPhone XR screen, 414x896
@@ -57,13 +57,14 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3):
     # /buttons stays (home-button-type 2: gesture navigation, no Home key).
     # 'samsung,a5xelte' keeps the shared SweetPlatformExpert IONameMatch.
     set_prop(root, 'compatible', mkadt.cstr('D22AP') + mkadt.cstr('iPhone10,3') +
-             mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,herolte') +
-             mkadt.cstr('samsung,exynos8890') + mkadt.cstr('AppleARM'))
+             mkadt.cstr('samsung,a5xelte') +
+             (mkadt.cstr('samsung,hero2lte') if device == 'hero2lte' else b'') +
+             mkadt.cstr('samsung,herolte') + mkadt.cstr('samsung,exynos8890') + mkadt.cstr('AppleARM'))
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(dram[0]))
     set_prop(chosen, 'dram-size', mkadt.u64(dram[1]))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('herolte-entry'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('herolte-entry'))
+    set_prop(chosen, 'firmware-version', mkadt.cstr(f'{device}-entry'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr(f'{device}-entry'))
     # MobileGestalt derives the UDID from these; without them it waits for a
     # Bluetooth/Wi-Fi driver forever, and LaunchServices never finishes seeding
     # the app database (SpringBoard stays on the boot logo). Synthetic,
@@ -158,9 +159,11 @@ if __name__ == '__main__':
                              'vm_compression_limit=98304), 2048 panics in write_pte_fast')
     parser.add_argument('--scale2', action='store_true',
                         help='iPhone XR screen, 828x1792 @2x (needs research/ipsw-x/d22ap.adt)')
+    parser.add_argument('--device', choices=('herolte', 'hero2lte'), default='herolte',
+                        help='herolte = Galaxy S7 (SM-G930F), hero2lte = Galaxy S7 edge (SM-G935F)')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
     dram = (BANK2_BASE, min(args.bank2_mb << 20, BANK2_SIZE)) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
-    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3))
+    blob = adt.serialize(build(canvas, dram, 2 if args.scale2 else 3, args.device))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')

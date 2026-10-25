@@ -1,3 +1,7 @@
+# Working on the HERO2LTE port (Galaxy S7 edge SM-G935F, Exynos 8890)
+
+- Branch `hero2lte`. Read `HERO2LTE_PROGRESS.md`, then the HEROLTE notes below: the same rules apply (BOOT only; never EFS, RECOVERY or bootloader partitions).
+
 # Working on the HEROLTE port (Galaxy S7 SM-G930F, Exynos 8890)
 
 - Read `HEROLTE_PROGRESS.md` and `docs/herolte-bringup.md` first; record new device evidence in the former. The A5XELTE files below are the reference implementation this port adapts.
