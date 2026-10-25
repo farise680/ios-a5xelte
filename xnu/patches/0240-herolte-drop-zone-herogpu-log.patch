@@ -12,10 +12,10 @@ index 6a40f85..d0c145d 100644
  bsd/dev/sweet_sample.c			standard
 diff --git a/bsd/dev/herolte_drop.c b/bsd/dev/herolte_drop.c
 new file mode 100644
-index 0000000..aadaaae
+index 0000000..e3fa75e
 --- /dev/null
 +++ b/bsd/dev/herolte_drop.c
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,213 @@
 +/*
 + * HEROLTE drop zone: files for the iOS root written from TWRP, without
 + * rebuilding the root image (the S7 has no network to copy them over).
@@ -36,7 +36,9 @@ index 0000000..aadaaae
 +#include <sys/systm.h>
 +#include <sys/errno.h>
 +#include <sys/fcntl.h>
++#include <sys/stat.h>
 +#include <sys/proc.h>
++#include <string.h>
 +#include <sys/vnode_internal.h>
 +#include <sys/namei.h>
 +#include <sys/kauth.h>
