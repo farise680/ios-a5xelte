@@ -73,7 +73,7 @@ edit('src/gallium/targets/osmesa/meson.build',
      "osmesa_hero_deps = []\n"
      "if host_machine.system() == 'darwin' and with_gallium_panfrost\n"
      "  osmesa_hero_files += 'hero_hw.c'\n"
-     "  osmesa_hero_deps += [driver_panfrost, dep_libdrm]\n"
+     "  osmesa_hero_deps += [driver_panfrost, dep_libdrm, idep_xmlconfig]\n"
      "endif\n\n"
      "libosmesa = shared_library(\n  osmesa_lib_name,\n  'osmesa_target.c', osmesa_hero_files,\n")
 edit('src/gallium/targets/osmesa/meson.build',

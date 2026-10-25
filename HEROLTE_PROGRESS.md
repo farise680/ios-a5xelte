@@ -331,6 +331,17 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   de usuario en VA 0x40000000 → **OK en 115 µs**. Siguiente: Mesa Panfrost
   compilado para iOS con un libdrm sobre HeroGPU (como Bergamota con
   freedreno), luego la capa Metal de Chlorophyll.
+- **0240-0242: programas de iOS en la GPU.** Zona de "drop" en USERDATA
+  (`tools/herolte-drop.py` desde TWRP, el kernel la instala en
+  `/private/var/herolte/` cuando la raíz pasa a lectura-escritura; launchd
+  corre `autorun`). 0242 corrige `pmap_sync_page_attributes_phys`, que
+  truncaba direcciones físicas sobre 4 GiB (panic en MapBO). Probado con
+  `herogpu-test` desde iOS: los parámetros de Panfrost, WRITE_VALUE → OK en
+  358 µs y un FRAGMENT clear de 64x64 → **4096/4096 píxeles OK en 197 µs**.
+- **Etapa 2 (`gpu/mesa`, workflow `mesa-ios`):** Mesa 25.0.7 Panfrost
+  (Gallium + compilador Midgard) dentro de OSMesa, compilado para iOS, con
+  un libdrm que traduce los ioctl de Panfrost a HeroGPU. `osmesa-test`
+  dibuja un triángulo con OpenGL y mide fps; resultado en el log del kernel.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
