@@ -321,8 +321,16 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   franja. Pendiente de probar.
 - **0238 (de ios-s9):** los hilos de UI y render van a los Mongoose
   (cpus 4-7) en vez de los A53, y AppleKeyStore responde wrap/unwrap
-  (securityd reintentaba sin fin y cada llamada iba al log). Pendiente de
-  probar.
+  (securityd reintentaba sin fin y cada llamada iba al log). Probado:
+  más fluido, log de AKS de 1600 a 19 líneas. El XR deja barras negras y
+  el Centro de Control sin blur (fondo negro: el blur es de Metal).
+- **0239: HeroGPU, etapa 1 de la aceleración completa.** Servicio IOKit
+  para que procesos de iOS usen la Mali (GetParam con los números de
+  Panfrost, CreateBO/FreeBO/MapBO, Submit). Selftest en el teléfono:
+  `GPU_ID 0x880 rev 0x2000 shaders 0xff0f`, un WRITE_VALUE desde un buffer
+  de usuario en VA 0x40000000 → **OK en 115 µs**. Siguiente: Mesa Panfrost
+  compilado para iOS con un libdrm sobre HeroGPU (como Bergamota con
+  freedreno), luego la capa Metal de Chlorophyll.
 - `sweetfb_scale=1` (0222) muestra la imagen rayada y duplicada (las
   superficies a 960x1706 tienen otro formato): queda desactivado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
